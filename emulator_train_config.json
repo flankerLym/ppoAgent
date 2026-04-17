@@ -1,18 +1,29 @@
 {
   "seed": 42,
   "device": "cpu",
-  "checkpoints_dir": "./checkpoints",
-  "tensorboard_log": "./tensorboard_logs",
-  "resume_from": "",
-  "save_freq": 5000,
-  "eval_freq": 5000,
-  "total_timesteps": 100000,
-  "policy": {
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8000,
+    "recv_bytes": 65536,
+    "reuse_addr": true,
+    "state_timeout_seconds": 30.0,
+    "go_action_url": "http://127.0.0.1:9000/rl_action"
+  },
+  "emulator": {
+    "workdir": "E:/keyan/code/block-emulator",
+    "command": ["go", "run", "main.go", "-g", "-S", "4", "-N", "3"],
+    "startup_wait_seconds": 2.0,
+    "kill_on_reset": true
+  },
+  "training": {
+    "total_timesteps": 100000,
     "learning_rate": 0.0003,
-    "n_steps": 2048,
+    "n_steps": 256,
     "batch_size": 64,
     "gamma": 0.99,
-    "verbose": 1
+    "verbose": 1,
+    "checkpoint_freq": 5000,
+    "checkpoints_dir": "./checkpoints"
   },
   "reward": {
     "tps_scale": 120.0,
@@ -32,18 +43,5 @@
     "large_shard_split_penalty": 1.0,
     "broker_usage_penalty": 0.15,
     "relay_usage_penalty": 0.12
-  },
-  "state_sampler": {
-    "load": [0.0, 1.0],
-    "tps": [0.0, 3000.0],
-    "cross_ratio": [0.0, 1.0],
-    "inner_tx": [0.0, 3000.0],
-    "cross_tx": [0.0, 3000.0],
-    "tcl": [0.0, 10.0],
-    "imbalance": [0.0, 1.0],
-    "shard_num": [2, 8],
-    "recent_reconfig": [0.0, 1.0],
-    "broker_ratio": [0.0, 1.0],
-    "relay_ratio": [0.0, 1.0]
   }
 }

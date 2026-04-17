@@ -1,0 +1,23 @@
+{
+  "workdir_emulator": "E:/keyan/code/block-emulator",
+  "workdir_agent": "E:/keyan/code/ppoAgent",
+  "service_script": "serve_best_model_with_emulator.py",
+  "service_config": "emulator_eval_config.json",
+  "runs": [
+    {
+      "name": "baseline_static",
+      "agent_mode": "none",
+      "emulator_command": ["go", "run", "main.go", "-g", "-S", "4", "-N", "3"]
+    },
+    {
+      "name": "method_best_model",
+      "agent_mode": "best_model",
+      "emulator_command": ["go", "run", "main.go", "-g", "-S", "4", "-N", "3"]
+    },
+    {
+      "name": "ablation_heuristic",
+      "agent_mode": "heuristic",
+      "emulator_command": ["go", "run", "main.go", "-g", "-S", "4", "-N", "3"]
+    }
+  ]
+}

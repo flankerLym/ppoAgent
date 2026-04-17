@@ -83,7 +83,6 @@ ACTIONS = {
     5: "enable_relay",
     6: "enter_cooldown",
 }
-
 ACTION_TEXT = {
     "noop": "不操作",
     "split_shard": "拆分分片",
@@ -185,23 +184,20 @@ class FeatureBuilder:
         self.reconfig_hist.append(1.0 if action in [1, 2, 3] else 0.0)
 
     def build(self, state):
-        return np.array(
-            [
-                clip01(float(state.get("load", 0.0))),
-                clip01(float(state.get("tps", 0.0)) / 3000.0),
-                clip01(float(state.get("cross_ratio", 0.0))),
-                clip01(float(state.get("inner_tx", 0.0)) / 3000.0),
-                clip01(float(state.get("cross_tx", 0.0)) / 3000.0),
-                clip01(float(state.get("tcl", 0.0)) / 10.0),
-                clip01(float(state.get("imbalance", 0.0))),
-                clip01(float(state.get("shard_num", 4)) / 8.0),
-                0.0,
-                clip01(float(sum(self.reconfig_hist) > 0)),
-                clip01(float(state.get("broker_ratio", 0.0))),
-                clip01(float(state.get("relay_ratio", 0.0))),
-            ],
-            dtype=np.float32,
-        )
+        return np.array([
+            clip01(float(state.get("load", 0.0))),
+            clip01(float(state.get("tps", 0.0)) / 3000.0),
+            clip01(float(state.get("cross_ratio", 0.0))),
+            clip01(float(state.get("inner_tx", 0.0)) / 3000.0),
+            clip01(float(state.get("cross_tx", 0.0)) / 3000.0),
+            clip01(float(state.get("tcl", 0.0)) / 10.0),
+            clip01(float(state.get("imbalance", 0.0))),
+            clip01(float(state.get("shard_num", 4)) / 8.0),
+            0.0,
+            clip01(float(sum(self.reconfig_hist) > 0)),
+            clip01(float(state.get("broker_ratio", 0.0))),
+            clip01(float(state.get("relay_ratio", 0.0))),
+        ], dtype=np.float32)
 
 
 def extract_json(data: bytes) -> bytes:
@@ -283,17 +279,15 @@ def action_text(action: int) -> str:
 
 def load_config(path: str) -> Dict[str, Any]:
     cfg = DEFAULT_CONFIG
-    if path:
-        p = Path(path)
-        if p.exists():
-            user_cfg = json.loads(p.read_text(encoding="utf-8"))
-            cfg = deep_update(DEFAULT_CONFIG, user_cfg)
+    p = Path(path)
+    if p.exists():
+        user_cfg = json.loads(p.read_text(encoding="utf-8"))
+        cfg = deep_update(DEFAULT_CONFIG, user_cfg)
     return cfg
 
 
 def load_best_or_fallback(env: gym.Env, cfg: Dict[str, Any]) -> Optional[PPO]:
-    load_order = cfg["policy"]["load_order"]
-    for path in load_order:
+    for path in cfg["policy"]["load_order"]:
         p = Path(path)
         if p.exists():
             print(f"加载模型: {p}")
@@ -320,7 +314,7 @@ def bind_server(server: socket.socket, cfg: Dict[str, Any]) -> Tuple[str, int]:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="service_controller_config.json")
+    parser.add_argument("--config", type=str, default="emulator_eval_config.json")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
