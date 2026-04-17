@@ -1,15 +1,11 @@
 import argparse
 import json
-import os
 import queue
 import re
-import shutil
 import socket
-import subprocess
 import threading
-import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict
 
 import gymnasium as gym
 import numpy as np
@@ -27,14 +23,7 @@ DEFAULT_CONFIG = {
         "port": 8000,
         "recv_bytes": 65536,
         "reuse_addr": True,
-        "state_timeout_seconds": 30.0,
         "go_action_url": "http://127.0.0.1:9000/rl_action"
-    },
-    "emulator": {
-        "workdir": "E:/keyan/code/block-emulator",
-        "command": ["go", "run", "main.go", "-g", "-S", "4", "-N", "3"],
-        "startup_wait_seconds": 2.0,
-        "kill_on_reset": True
     },
     "training": {
         "total_timesteps": 100000,
@@ -126,7 +115,9 @@ class StateReceiver(threading.Thread):
             except queue.Empty:
                 break
 
-    def get(self, timeout: float) -> Dict[str, Any]:
+    def get(self, timeout=None) -> Dict[str, Any]:
+        if timeout is None:
+            return self.queue.get()
         return self.queue.get(timeout=timeout)
 
     def stop(self):
@@ -137,12 +128,11 @@ class StateReceiver(threading.Thread):
             pass
 
 
-class BlockEmulatorOnlineEnv(gym.Env):
+class ManualEmulatorOnlineEnv(gym.Env):
     def __init__(self, cfg: Dict[str, Any]):
         super().__init__()
         self.cfg = cfg
         self.server_cfg = cfg["server"]
-        self.emu_cfg = cfg["emulator"]
         self.reward_cfg = cfg["reward"]
         self.action_space = spaces.Discrete(7)
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(12,), dtype=np.float32)
@@ -153,7 +143,6 @@ class BlockEmulatorOnlineEnv(gym.Env):
             bool(self.server_cfg["reuse_addr"]),
         )
         self.receiver.start()
-        self.proc: Optional[subprocess.Popen] = None
         self.current_state = np.zeros(12, dtype=np.float32)
 
     def _state_to_obs(self, state: Dict[str, Any]) -> np.ndarray:
@@ -242,36 +231,12 @@ class BlockEmulatorOnlineEnv(gym.Env):
         except Exception:
             pass
 
-    def _start_emulator(self):
-        workdir = str(self.emu_cfg["workdir"])
-        cmd = self.emu_cfg["command"]
-        self.proc = subprocess.Popen(
-            cmd,
-            cwd=workdir,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        time.sleep(float(self.emu_cfg["startup_wait_seconds"]))
-
-    def _stop_emulator(self):
-        if self.proc is not None and self.proc.poll() is None:
-            self.proc.kill()
-            try:
-                self.proc.wait(timeout=5)
-            except Exception:
-                pass
-        self.proc = None
-
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        if bool(self.emu_cfg["kill_on_reset"]):
-            self._stop_emulator()
         self.receiver.clear()
-        self._start_emulator()
-
-        timeout = float(self.server_cfg["state_timeout_seconds"])
-        first_state = self.receiver.get(timeout=timeout)
+        print("[TRAIN] 等待你手动启动 emulator，并发送第一条 state ...")
+        first_state = self.receiver.get(timeout=None)
+        print("[TRAIN] 已收到第一条 state")
         self.current_state = self._state_to_obs(first_state)
         return self.current_state, {}
 
@@ -279,24 +244,16 @@ class BlockEmulatorOnlineEnv(gym.Env):
         self._send_action(int(action))
         reward = self._reward(self.current_state, int(action))
 
+        print("[TRAIN] 等待下一条 state ...")
+        next_state = self.receiver.get(timeout=None)
+        print("[TRAIN] 已收到下一条 state")
+        self.current_state = self._state_to_obs(next_state)
+
         terminated = False
         truncated = False
-        timeout = float(self.server_cfg["state_timeout_seconds"])
-
-        try:
-            next_state = self.receiver.get(timeout=timeout)
-            self.current_state = self._state_to_obs(next_state)
-        except queue.Empty:
-            # 如果 emulator 结束或超时，结束一个 episode
-            terminated = True
-
-        if self.proc is not None and self.proc.poll() is not None:
-            terminated = True
-
         return self.current_state, reward, terminated, truncated, {}
 
     def close(self):
-        self._stop_emulator()
         self.receiver.stop()
 
 
@@ -318,7 +275,7 @@ def main():
     ckpt_dir = Path(cfg["training"]["checkpoints_dir"])
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    env = BlockEmulatorOnlineEnv(cfg)
+    env = ManualEmulatorOnlineEnv(cfg)
 
     model = PPO(
         "MlpPolicy",
