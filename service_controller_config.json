@@ -1,0 +1,59 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8000,
+    "recv_bytes": 4096,
+    "reuse_addr": true,
+    "go_action_url": "http://127.0.0.1:9000/rl_action",
+    "allow_auto_fallback_port": false
+  },
+  "policy": {
+    "device": "cpu",
+    "deterministic": true,
+    "load_order": [
+      "./checkpoints/best_model/best_model.zip",
+      "./checkpoints/final_model.zip",
+      "./ppo_chain_controller.zip"
+    ]
+  },
+  "features": {
+    "window": 5
+  },
+  "actions": {
+    "cooldown_seconds": 3.0
+  },
+  "reward": {
+    "tps_scale": 120.0,
+    "cross_penalty": 2.5,
+    "tcl_penalty": 0.8,
+    "imbalance_penalty": 1.2,
+    "inner_bonus_div": 4000.0,
+    "cross_cost_div": 5000.0,
+    "reconfig_penalty": 0.6,
+    "recent_reconfig_penalty": 0.8,
+    "overload_penalty": 1.5,
+    "underload_penalty": 0.1,
+    "broker_bonus": 0.3,
+    "relay_bonus": 0.2,
+    "clpa_bonus": 0.4,
+    "small_shard_merge_penalty": 1.0,
+    "large_shard_split_penalty": 1.0,
+    "broker_usage_penalty": 0.15,
+    "relay_usage_penalty": 0.12
+  },
+  "heuristic": {
+    "idle_load": 0.01,
+    "idle_tps": 10.0,
+    "recent_reconfig_block": 0.5,
+    "enable_broker_cross_ratio": 0.45,
+    "trigger_clpa_cross_ratio": 0.30,
+    "split_load": 0.85,
+    "merge_load": 0.20,
+    "merge_cross_ratio": 0.08,
+    "enable_relay_cross_ratio": 0.20,
+    "broker_ratio_limit": 0.5,
+    "relay_ratio_limit": 0.5,
+    "min_shards": 2,
+    "max_shards": 8
+  }
+}

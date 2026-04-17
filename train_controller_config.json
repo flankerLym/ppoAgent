@@ -1,0 +1,49 @@
+{
+  "seed": 42,
+  "device": "cpu",
+  "checkpoints_dir": "./checkpoints",
+  "tensorboard_log": "./tensorboard_logs",
+  "resume_from": "",
+  "save_freq": 5000,
+  "eval_freq": 5000,
+  "total_timesteps": 100000,
+  "policy": {
+    "learning_rate": 0.0003,
+    "n_steps": 2048,
+    "batch_size": 64,
+    "gamma": 0.99,
+    "verbose": 1
+  },
+  "reward": {
+    "tps_scale": 120.0,
+    "cross_penalty": 2.5,
+    "tcl_penalty": 0.8,
+    "imbalance_penalty": 1.2,
+    "inner_bonus_div": 4000.0,
+    "cross_cost_div": 5000.0,
+    "reconfig_penalty": 0.6,
+    "recent_reconfig_penalty": 0.8,
+    "overload_penalty": 1.5,
+    "underload_penalty": 0.1,
+    "broker_bonus": 0.3,
+    "relay_bonus": 0.2,
+    "clpa_bonus": 0.4,
+    "small_shard_merge_penalty": 1.0,
+    "large_shard_split_penalty": 1.0,
+    "broker_usage_penalty": 0.15,
+    "relay_usage_penalty": 0.12
+  },
+  "state_sampler": {
+    "load": [0.0, 1.0],
+    "tps": [0.0, 3000.0],
+    "cross_ratio": [0.0, 1.0],
+    "inner_tx": [0.0, 3000.0],
+    "cross_tx": [0.0, 3000.0],
+    "tcl": [0.0, 10.0],
+    "imbalance": [0.0, 1.0],
+    "shard_num": [2, 8],
+    "recent_reconfig": [0.0, 1.0],
+    "broker_ratio": [0.0, 1.0],
+    "relay_ratio": [0.0, 1.0]
+  }
+}
