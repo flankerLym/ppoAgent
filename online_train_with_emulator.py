@@ -1,310 +1,391 @@
-import argparse
-import json
-import queue
-import re
 import socket
-import threading
+import json
+import re
+from collections import deque
 from pathlib import Path
-from typing import Any, Dict
+import time as pytime
 
-import gymnasium as gym
 import numpy as np
 import requests
-from gymnasium import spaces
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CheckpointCallback
+import gymnasium as gym
+from gymnasium import spaces
 
+ACTIONS = {
+    0: "noop",
+    1: "split_shard",
+    2: "merge_shard",
+    3: "trigger_clpa",
+    4: "enable_broker",
+    5: "enable_relay",
+    6: "enter_cooldown",
+}
 
-DEFAULT_CONFIG = {
-    "seed": 42,
-    "device": "cpu",
-    "server": {
-        "host": "127.0.0.1",
-        "port": 8000,
-        "recv_bytes": 65536,
-        "reuse_addr": True,
-        "go_action_url": "http://127.0.0.1:9000/rl_action"
-    },
-    "training": {
-        "total_timesteps": 100000,
-        "learning_rate": 3e-4,
-        "n_steps": 256,
-        "batch_size": 64,
-        "gamma": 0.99,
-        "verbose": 1,
-        "checkpoint_freq": 5000,
-        "checkpoints_dir": "./checkpoints"
-    },
-    "reward": {
-        "tps_scale": 120.0,
-        "cross_penalty": 2.5,
-        "tcl_penalty": 0.8,
-        "imbalance_penalty": 1.2,
-        "inner_bonus_div": 4000.0,
-        "cross_cost_div": 5000.0,
-        "reconfig_penalty": 0.6,
-        "recent_reconfig_penalty": 0.8,
-        "overload_penalty": 1.5,
-        "underload_penalty": 0.1,
-        "broker_bonus": 0.3,
-        "relay_bonus": 0.2,
-        "clpa_bonus": 0.4,
-        "small_shard_merge_penalty": 1.0,
-        "large_shard_split_penalty": 1.0,
-        "broker_usage_penalty": 0.15,
-        "relay_usage_penalty": 0.12
-    }
+ACTION_TEXT = {
+    "noop": "不操作",
+    "split_shard": "拆分分片",
+    "merge_shard": "合并分片",
+    "trigger_clpa": "触发CLPA重分区",
+    "enable_broker": "启用Broker模式",
+    "enable_relay": "启用Relay模式",
+    "enter_cooldown": "进入冷却期",
+}
+
+MODEL_PATH = Path("./checkpoints/best_model/best_model.zip")
+FALLBACK_MODEL_PATH = Path("./checkpoints/final_model.zip")
+ACTION_COOLDOWN = 3.0
+
+DECISION_CFG = {
+    "k_interval": 3,
+    "cooldown_blocks": 3,
+    "cross_ratio_emergency": 0.35,
+    "cross_rise_streak": 3,
+    "load_emergency": 0.85,
+    "load_high_streak": 2,
+    "tcl_emergency": 4.0,
+    "tcl_worsen_streak": 3,
+    "near_full_threshold": 0.95
 }
 
 
-def deep_update(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
-    result = dict(base)
-    for k, v in override.items():
-        if isinstance(v, dict) and isinstance(result.get(k), dict):
-            result[k] = deep_update(result[k], v)
-        else:
-            result[k] = v
-    return result
+def clip01(x):
+    return float(max(0.0, min(1.0, x)))
 
 
-def extract_json(data: bytes) -> bytes:
+class UnifiedChainEnv(gym.Env):
+    def __init__(self):
+        super().__init__()
+        self.action_space = spaces.Discrete(len(ACTIONS))
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(12,), dtype=np.float32)
+        self.state = np.zeros(12, dtype=np.float32)
+
+    def set_state(self, state_vec):
+        self.state = np.array(state_vec, dtype=np.float32)
+
+    def step(self, action):
+        reward = self._get_reward(int(action))
+        return self.state, reward, False, False, {}
+
+    def _get_reward(self, action):
+        load = float(self.state[0])
+        tps = float(self.state[1]) * 3000.0
+        cross_ratio = float(self.state[2])
+        inner_tx = float(self.state[3]) * 3000.0
+        cross_tx = float(self.state[4]) * 3000.0
+        tcl = float(self.state[5]) * 10.0
+        imbalance = float(self.state[6])
+        shard_num = float(self.state[7]) * 8.0
+        recent_reconfig = float(self.state[9])
+        broker_ratio = float(self.state[10])
+        relay_ratio = float(self.state[11])
+
+        reward = 0.0
+        reward += tps / 120.0
+        reward -= cross_ratio * 2.5
+        reward -= tcl * 0.8
+        reward -= imbalance * 1.2
+        reward += inner_tx / 4000.0
+        reward -= cross_tx / 5000.0
+
+        if action in [1, 2, 3]:
+            reward -= 0.6
+        if load > 0.92:
+            reward -= 1.5
+        elif load < 0.01:
+            reward -= 0.1
+
+        if action in [1, 2, 3] and recent_reconfig > 0.5:
+            reward -= 0.8
+        if action == 4 and cross_ratio > 0.3:
+            reward += 0.3
+        if action == 5 and cross_ratio > 0.25:
+            reward += 0.2
+        if action == 3 and imbalance > 0.2:
+            reward += 0.4
+        if action == 2 and shard_num <= 2:
+            reward -= 1.0
+        if action == 1 and shard_num >= 8:
+            reward -= 1.0
+
+        reward -= broker_ratio * 0.15
+        reward -= relay_ratio * 0.12
+        return round(float(reward), 3)
+
+    def reset(self, seed=None, options=None):
+        self.state = np.zeros(12, dtype=np.float32)
+        return self.state, {}
+
+
+class FeatureBuilder:
+    def __init__(self, window=5):
+        self.window = window
+        self.reconfig_hist = deque(maxlen=window)
+
+    def update(self, state, action=0):
+        self.reconfig_hist.append(1.0 if action in [1, 2, 3] else 0.0)
+
+    def build(self, state):
+        return np.array([
+            clip01(float(state.get("load", 0.0))),
+            clip01(float(state.get("tps", 0.0)) / 3000.0),
+            clip01(float(state.get("cross_ratio", 0.0))),
+            clip01(float(state.get("inner_tx", 0.0)) / 3000.0),
+            clip01(float(state.get("cross_tx", 0.0)) / 3000.0),
+            clip01(float(state.get("tcl", 0.0)) / 10.0),
+            clip01(float(state.get("imbalance", 0.0))),
+            clip01(float(state.get("shard_num", 4)) / 8.0),
+            0.0,
+            clip01(float(state.get("recent_reconfig", 0.0))),
+            clip01(float(state.get("broker_ratio", 0.0))),
+            clip01(float(state.get("relay_ratio", 0.0))),
+        ], dtype=np.float32)
+
+
+class DecisionGate:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.last_decision_epoch = {}
+        self.cooldown_until = {}
+        self.cross_hist = {}
+        self.load_hist = {}
+        self.tcl_hist = {}
+
+    def _get_hist(self, table, shard_id, maxlen):
+        if shard_id not in table:
+            table[shard_id] = deque(maxlen=maxlen)
+        return table[shard_id]
+
+    def update(self, state):
+        shard_id = int(state.get("shard_id", 0))
+        self._get_hist(self.cross_hist, shard_id, self.cfg["cross_rise_streak"]).append(float(state.get("cross_ratio", 0.0)))
+        self._get_hist(self.load_hist, shard_id, self.cfg["load_high_streak"]).append(float(state.get("load", 0.0)))
+        self._get_hist(self.tcl_hist, shard_id, self.cfg["tcl_worsen_streak"]).append(float(state.get("tcl", 0.0)))
+
+    def emergency_triggered(self, state):
+        shard_id = int(state.get("shard_id", 0))
+        cross_hist = self._get_hist(self.cross_hist, shard_id, self.cfg["cross_rise_streak"])
+        load_hist = self._get_hist(self.load_hist, shard_id, self.cfg["load_high_streak"])
+        tcl_hist = self._get_hist(self.tcl_hist, shard_id, self.cfg["tcl_worsen_streak"])
+
+        cross_now = float(state.get("cross_ratio", 0.0))
+        load_now = float(state.get("load", 0.0))
+        tcl_now = float(state.get("tcl", 0.0))
+
+        cross_rising = (
+            len(cross_hist) == self.cfg["cross_rise_streak"] and
+            all(cross_hist[i] < cross_hist[i + 1] for i in range(len(cross_hist) - 1)) and
+            cross_now >= self.cfg["cross_ratio_emergency"]
+        )
+        load_high = (
+            len(load_hist) == self.cfg["load_high_streak"] and
+            all(v >= self.cfg["load_emergency"] for v in load_hist)
+        )
+        tcl_worsening = (
+            len(tcl_hist) == self.cfg["tcl_worsen_streak"] and
+            all(tcl_hist[i] < tcl_hist[i + 1] for i in range(len(tcl_hist) - 1)) and
+            tcl_now >= self.cfg["tcl_emergency"]
+        )
+        near_full = load_now >= self.cfg["near_full_threshold"]
+        return cross_rising or load_high or tcl_worsening or near_full
+
+    def allow_decision(self, state):
+        shard_id = int(state.get("shard_id", 0))
+        epoch = int(state.get("epoch", 0))
+
+        if epoch < self.cooldown_until.get(shard_id, -1):
+            if self.emergency_triggered(state):
+                return True, "emergency_in_cooldown"
+            return False, "cooldown"
+
+        if self.emergency_triggered(state):
+            return True, "emergency"
+
+        last_epoch = self.last_decision_epoch.get(shard_id, None)
+        if last_epoch is None:
+            return True, "first_decision"
+
+        if epoch - last_epoch >= self.cfg["k_interval"]:
+            return True, "interval"
+
+        return False, "wait_interval"
+
+    def on_action_sent(self, state, action):
+        shard_id = int(state.get("shard_id", 0))
+        epoch = int(state.get("epoch", 0))
+        self.last_decision_epoch[shard_id] = epoch
+        if action in [1, 2, 3]:
+            self.cooldown_until[shard_id] = epoch + self.cfg["cooldown_blocks"]
+
+
+def extract_json(data):
     match = re.search(rb"\r\n\r\n(.*)", data, re.S)
     return match.group(1) if match else b""
 
 
-class StateReceiver(threading.Thread):
-    def __init__(self, host: str, port: int, recv_bytes: int, reuse_addr: bool = True):
-        super().__init__(daemon=True)
-        self.host = host
-        self.port = port
-        self.recv_bytes = recv_bytes
-        self.reuse_addr = reuse_addr
-        self.queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
-        self._stop_flag = threading.Event()
-        self.server = socket.socket()
-        if self.reuse_addr:
-            self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server.bind((self.host, self.port))
-        self.server.listen(10)
+def heuristic_action(state):
+    load = float(state.get("load", 0.0))
+    tps = float(state.get("tps", 0.0))
+    cross_ratio = float(state.get("cross_ratio", 0.0))
+    shard_num = int(state.get("shard_num", 4))
+    broker_ratio = float(state.get("broker_ratio", 0.0))
+    relay_ratio = float(state.get("relay_ratio", 0.0))
+    recent_reconfig = float(state.get("recent_reconfig", 0.0))
 
-    def run(self):
-        while not self._stop_flag.is_set():
-            try:
-                conn, _addr = self.server.accept()
-                data = conn.recv(self.recv_bytes)
-                if data:
-                    raw = extract_json(data)
-                    if raw:
-                        try:
-                            state = json.loads(raw)
-                            self.queue.put(state)
-                        except Exception:
-                            pass
-                try:
-                    conn.send(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-                except Exception:
-                    pass
-                conn.close()
-            except OSError:
-                break
-
-    def clear(self):
-        while not self.queue.empty():
-            try:
-                self.queue.get_nowait()
-            except queue.Empty:
-                break
-
-    def get(self, timeout=None) -> Dict[str, Any]:
-        if timeout is None:
-            return self.queue.get()
-        return self.queue.get(timeout=timeout)
-
-    def stop(self):
-        self._stop_flag.set()
-        try:
-            self.server.close()
-        except Exception:
-            pass
+    if load < 0.01 and tps < 10:
+        return 0
+    if recent_reconfig > 0.5:
+        return 0
+    if cross_ratio > 0.45 and broker_ratio < 0.5:
+        return 4
+    if cross_ratio > 0.30:
+        return 3
+    if load > 0.85 and shard_num < 8:
+        return 1
+    if load < 0.20 and cross_ratio < 0.08 and shard_num > 2:
+        return 2
+    if relay_ratio < 0.5 and cross_ratio > 0.20:
+        return 5
+    return 0
 
 
-class ManualEmulatorOnlineEnv(gym.Env):
-    def __init__(self, cfg: Dict[str, Any]):
-        super().__init__()
-        self.cfg = cfg
-        self.server_cfg = cfg["server"]
-        self.reward_cfg = cfg["reward"]
-        self.action_space = spaces.Discrete(7)
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(12,), dtype=np.float32)
-        self.receiver = StateReceiver(
-            self.server_cfg["host"],
-            int(self.server_cfg["port"]),
-            int(self.server_cfg["recv_bytes"]),
-            bool(self.server_cfg["reuse_addr"]),
-        )
-        self.receiver.start()
-        self.current_state = np.zeros(12, dtype=np.float32)
+def safe_action_guard(state, action):
+    load = float(state.get("load", 0.0))
+    tps = float(state.get("tps", 0.0))
+    shard_num = int(state.get("shard_num", 4))
+    cross_ratio = float(state.get("cross_ratio", 0.0))
+    recent_reconfig = float(state.get("recent_reconfig", 0.0))
 
-    def _state_to_obs(self, state: Dict[str, Any]) -> np.ndarray:
-        return np.array([
-            float(max(0.0, min(1.0, state.get("load", 0.0)))),
-            float(max(0.0, min(1.0, state.get("tps", 0.0) / 3000.0))),
-            float(max(0.0, min(1.0, state.get("cross_ratio", 0.0)))),
-            float(max(0.0, min(1.0, state.get("inner_tx", 0.0) / 3000.0))),
-            float(max(0.0, min(1.0, state.get("cross_tx", 0.0) / 3000.0))),
-            float(max(0.0, min(1.0, state.get("tcl", 0.0) / 10.0))),
-            float(max(0.0, min(1.0, state.get("imbalance", 0.0)))),
-            float(max(0.0, min(1.0, state.get("shard_num", 4) / 8.0))),
-            0.0,
-            float(max(0.0, min(1.0, state.get("recent_reconfig", 0.0)))),
-            float(max(0.0, min(1.0, state.get("broker_ratio", 0.0)))),
-            float(max(0.0, min(1.0, state.get("relay_ratio", 0.0)))),
-        ], dtype=np.float32)
-
-    def _reward(self, obs: np.ndarray, action: int) -> float:
-        c = self.reward_cfg
-        load = float(obs[0])
-        tps = float(obs[1]) * 3000.0
-        cross_ratio = float(obs[2])
-        inner_tx = float(obs[3]) * 3000.0
-        cross_tx = float(obs[4]) * 3000.0
-        tcl = float(obs[5]) * 10.0
-        imbalance = float(obs[6])
-        shard_num = float(obs[7]) * 8.0
-        recent_reconfig = float(obs[9])
-        broker_ratio = float(obs[10])
-        relay_ratio = float(obs[11])
-
-        reward = 0.0
-        reward += tps / float(c["tps_scale"])
-        reward -= cross_ratio * float(c["cross_penalty"])
-        reward -= tcl * float(c["tcl_penalty"])
-        reward -= imbalance * float(c["imbalance_penalty"])
-        reward += inner_tx / float(c["inner_bonus_div"])
-        reward -= cross_tx / float(c["cross_cost_div"])
-
-        if action in [1, 2, 3]:
-            reward -= float(c["reconfig_penalty"])
-        if load > 0.92:
-            reward -= float(c["overload_penalty"])
-        elif load < 0.01:
-            reward -= float(c["underload_penalty"])
-
-        if action in [1, 2, 3] and recent_reconfig > 0.5:
-            reward -= float(c["recent_reconfig_penalty"])
-        if action == 4 and cross_ratio > 0.3:
-            reward += float(c["broker_bonus"])
-        if action == 5 and cross_ratio > 0.25:
-            reward += float(c["relay_bonus"])
-        if action == 3 and imbalance > 0.2:
-            reward += float(c["clpa_bonus"])
-        if action == 2 and shard_num <= 2:
-            reward -= float(c["small_shard_merge_penalty"])
-        if action == 1 and shard_num >= 8:
-            reward -= float(c["large_shard_split_penalty"])
-
-        reward -= broker_ratio * float(c["broker_usage_penalty"])
-        reward -= relay_ratio * float(c["relay_usage_penalty"])
-        return float(reward)
-
-    def _send_action(self, action: int):
-        actions = {
-            0: "noop",
-            1: "split_shard",
-            2: "merge_shard",
-            3: "trigger_clpa",
-            4: "enable_broker",
-            5: "enable_relay",
-            6: "enter_cooldown",
-        }
-        payload = {
-            "action_id": int(action),
-            "action_name": actions[action],
-            "shard_id": 0,
-            "params": {
-                "delta": 1 if action == 1 else (-1 if action == 2 else 0),
-                "cooldown_rounds": 3 if action == 6 else 0,
-            },
-        }
-        try:
-            requests.post(self.server_cfg["go_action_url"], json=payload, timeout=0.5)
-        except Exception:
-            pass
-
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-        self.receiver.clear()
-        print("[TRAIN] 等待你手动启动 emulator，并发送第一条 state ...")
-        first_state = self.receiver.get(timeout=None)
-        print("[TRAIN] 已收到第一条 state")
-        self.current_state = self._state_to_obs(first_state)
-        return self.current_state, {}
-
-    def step(self, action):
-        self._send_action(int(action))
-        reward = self._reward(self.current_state, int(action))
-
-        print("[TRAIN] 等待下一条 state ...")
-        next_state = self.receiver.get(timeout=None)
-        print("[TRAIN] 已收到下一条 state")
-        self.current_state = self._state_to_obs(next_state)
-
-        terminated = False
-        truncated = False
-        return self.current_state, reward, terminated, truncated, {}
-
-    def close(self):
-        self.receiver.stop()
+    if load < 0.01 and tps < 10:
+        return 0
+    if recent_reconfig > 0.5 and action in [1, 2, 3]:
+        return 0
+    if action == 2 and shard_num <= 2:
+        return 0
+    if action == 1 and shard_num >= 8:
+        return 0
+    if action in [4, 5] and cross_ratio < 0.10:
+        return 0
+    return action
 
 
-def load_config(path: str) -> Dict[str, Any]:
-    cfg = DEFAULT_CONFIG
-    p = Path(path)
-    if p.exists():
-        user_cfg = json.loads(p.read_text(encoding="utf-8"))
-        cfg = deep_update(DEFAULT_CONFIG, user_cfg)
-    return cfg
+def build_action_payload(state, action):
+    name = ACTIONS[action]
+    return {
+        "action_id": int(action),
+        "action_name": name,
+        "shard_id": int(state.get("shard_id", 0)),
+        "params": {
+            "delta": 1 if name == "split_shard" else (-1 if name == "merge_shard" else 0),
+            "cooldown_rounds": 3 if name == "enter_cooldown" else 0,
+        },
+    }
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="emulator_train_config.json")
-    args = parser.parse_args()
-
-    cfg = load_config(args.config)
-    ckpt_dir = Path(cfg["training"]["checkpoints_dir"])
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-
-    env = ManualEmulatorOnlineEnv(cfg)
-
-    model = PPO(
-        "MlpPolicy",
-        env,
-        learning_rate=float(cfg["training"]["learning_rate"]),
-        n_steps=int(cfg["training"]["n_steps"]),
-        batch_size=int(cfg["training"]["batch_size"]),
-        gamma=float(cfg["training"]["gamma"]),
-        verbose=int(cfg["training"]["verbose"]),
-        device=str(cfg["device"]),
-        seed=int(cfg["seed"]),
-    )
-
-    checkpoint_callback = CheckpointCallback(
-        save_freq=int(cfg["training"]["checkpoint_freq"]),
-        save_path=str(ckpt_dir),
-        name_prefix="ppo_controller"
-    )
-
+def send_action_to_go(payload):
     try:
-        model.learn(
-            total_timesteps=int(cfg["training"]["total_timesteps"]),
-            callback=checkpoint_callback,
-        )
-        model.save(str(ckpt_dir / "final_model.zip"))
-        print(f"最终模型已保存到: {ckpt_dir / 'final_model.zip'}")
-    finally:
-        env.close()
+        requests.post("http://127.0.0.1:9000/rl_action", json=payload, timeout=0.3)
+    except Exception:
+        pass
+
+
+def action_text(action):
+    return ACTION_TEXT[ACTIONS[action]]
+
+
+def load_policy(env):
+    if MODEL_PATH.exists():
+        print(f"加载最优 PPO 模型: {MODEL_PATH}")
+        return PPO.load(str(MODEL_PATH), env=env, device="cpu")
+    if FALLBACK_MODEL_PATH.exists():
+        print(f"加载最终 PPO 模型: {FALLBACK_MODEL_PATH}")
+        return PPO.load(str(FALLBACK_MODEL_PATH), env=env, device="cpu")
+    print("未找到 best/final 权重，暂时使用启发式策略。")
+    return None
 
 
 if __name__ == "__main__":
-    main()
+    env = UnifiedChainEnv()
+    model = load_policy(env)
+    feat = FeatureBuilder(window=5)
+    gate = DecisionGate(DECISION_CFG)
+    last_sent_action = None
+    last_sent_ts = 0.0
+
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 8000))
+    server.listen(10)
+
+    print("统一区块链控制服务已启动")
+    print("接收状态 -> 块级观测 -> 间隔/紧急触发决策 -> Go执行器")
+    print("=" * 80)
+
+    while True:
+        conn, addr = server.accept()
+        data = conn.recv(65536)
+        if not data:
+            conn.close()
+            continue
+
+        try:
+            raw = extract_json(data)
+            state = json.loads(raw)
+
+            if bool(state.get("done", False)):
+                print("[CTRL] 收到 done=true，本轮仿真结束")
+                conn.send(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                conn.close()
+                continue
+
+            obs = feat.build(state)
+            gate.update(state)
+            allow_decision, reason = gate.allow_decision(state)
+
+            if allow_decision:
+                if model is None:
+                    action = heuristic_action(state)
+                else:
+                    action, _ = model.predict(obs, deterministic=True)
+                    action = int(action)
+                action = safe_action_guard(state, int(action))
+            else:
+                action = 0
+
+            env.set_state(obs)
+            reward = env._get_reward(action)
+            payload = build_action_payload(state, action)
+
+            now = pytime.time()
+            should_send = (
+                allow_decision and
+                action != 0 and (
+                    last_sent_action is None
+                    or action != last_sent_action
+                    or (now - last_sent_ts) >= ACTION_COOLDOWN
+                )
+            )
+
+            if should_send:
+                send_action_to_go(payload)
+                gate.on_action_sent(state, action)
+                last_sent_action = action
+                last_sent_ts = now
+
+            feat.update(state, action)
+
+            print(
+                f"shard={state.get('shard_id')} "
+                f"epoch={state.get('epoch', -1)} "
+                f"reward={reward:>6} "
+                f"load={state.get('load', 0):.2f} "
+                f"tps={state.get('tps', 0):>6.1f} "
+                f"cross={state.get('cross_ratio', 0):.2f} "
+                f"decision={reason} "
+                f"action={action_text(action)} "
+                f"sent={'Y' if should_send else 'N'}"
+            )
+        except Exception as e:
+            print("错误：", e)
+
+        conn.send(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+        conn.close()
